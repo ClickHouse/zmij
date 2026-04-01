@@ -62,6 +62,14 @@ static_assert(!ZMIJ_USE_SSE4_1 || ZMIJ_USE_SSE);
 #  define ZMIJ_USE_SSE4_1 0
 #endif
 
+// ZMIJ_USE_SIMD defaults to 1 but requires at least one SIMD backend.
+// Without this, platforms like riscv64/s390x/loongarch64 fall into the
+// SSE branch of #if/#elif/#else chains and fail to compile.
+#if ZMIJ_USE_SIMD && !ZMIJ_USE_NEON && !ZMIJ_USE_SSE
+#  undef ZMIJ_USE_SIMD
+#  define ZMIJ_USE_SIMD 0
+#endif
+
 #define ZMIJ_USE_SIMD_SHUFFLE \
   ((ZMIJ_USE_NEON || ZMIJ_USE_SSE4_1) && !ZMIJ_OPTIMIZE_SIZE)
 
