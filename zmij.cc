@@ -510,13 +510,26 @@ struct exp_string_table {
   constexpr exp_string_table() {
     for (int e = min_dec_exp; e <= traits::max_exponent10 && enable; ++e) {
       uint64_t abs_e = e >= 0 ? e : -e;
-      uint64_t bc = abs_e % 100;
-      uint64_t val = ((bc % 10 + '0') << 8) | (bc / 10 + '0');
-      if (uint64_t a = abs_e / 100) val = (val << 8) | (a + '0');
-      uint64_t len =
-          e >= -4 && e < traits::max_fixed_dec_exp ? 0 : 4 + (abs_e >= 100);
-      data[e + offset] =
-          (len << 48) | (val << 16) | (uint64_t(e >= 0 ? '+' : '-') << 8) | 'e';
+      // Dragonbox-compatible: fixed range is [-6, 20] for dec_exp.
+      if (e >= -6 && e <= 20) { data[e + offset] = 0; continue; }
+      // Format: "e" ["-"] digits (no '+', no zero-padding).
+      uint64_t val = 'e';
+      int pos = 1;
+      if (e < 0) { val |= uint64_t('-') << 8; pos = 2; }
+      if (abs_e >= 100) {
+        val |= uint64_t('0' + abs_e / 100) << (pos * 8);
+        val |= uint64_t('0' + (abs_e / 10) % 10) << ((pos + 1) * 8);
+        val |= uint64_t('0' + abs_e % 10) << ((pos + 2) * 8);
+        pos += 3;
+      } else if (abs_e >= 10) {
+        val |= uint64_t('0' + abs_e / 10) << (pos * 8);
+        val |= uint64_t('0' + abs_e % 10) << ((pos + 1) * 8);
+        pos += 2;
+      } else {
+        val |= uint64_t('0' + abs_e) << (pos * 8);
+        pos += 1;
+      }
+      data[e + offset] = (uint64_t(pos) << 48) | val;
     }
   }
 };
@@ -1161,7 +1174,13 @@ auto write(Float value, char* buffer) noexcept -> char* {
   constexpr uint64_t threshold = uint64_t(traits::num_bits == 64 ? 1e15 : 1e8);
   if (bin_exp == 0 || bin_exp == traits::exp_mask) [[ZMIJ_UNLIKELY]] {
     if (bin_exp != 0) {
-      memcpy(buffer, bin_sig == 0 ? "inf" : "nan", 4);
+      if (bin_sig != 0) {
+        // NaN: never include sign (dragonbox compatibility).
+        buffer -= traits::is_negative(bits);
+        memcpy(buffer, "nan", 4);
+      } else {
+        memcpy(buffer, "inf", 4);
+      }
       return buffer + 3;
     }
     if (bin_sig == 0) {
@@ -1218,6 +1237,52 @@ auto write(Float value, char* buffer) noexcept -> char* {
     return sig_start + fmt.exp_pos[total - 1];
   }
 
+  // Extended fixed range: dragonbox-compatible wider thresholds [-6, 20].
+  // Uses simple scalar code since these are edge cases outside the
+  // precomputed table range.
+  if (dec_exp >= -6 && dec_exp <= 20) {
+    // Reconstruct full significand.
+    uint64_t full_sig;
+    if constexpr (split_last_digit)
+      full_sig = uint64_t(dec.sig) * 10 + dec.last_digit;
+    else
+      full_sig = dec.sig;
+
+    // Single-pass digit extraction: write MSB-first from the end of a
+    // fixed-size buffer, then strip trailing zeros by trimming the end.
+    // This replaces three separate div-by-10 loops (strip, count, extract)
+    // with one.
+    char digits[20];
+    int pos = 20;
+    do { digits[--pos] = '0' + char(full_sig % 10); full_sig /= 10; }
+    while (full_sig > 0);
+    int end = 20;
+    while (digits[end - 1] == '0') --end;
+    char* dptr = digits + pos;
+    int nd = end - pos;
+
+    int k = dec_exp + 1;  // decimal point position
+    if (k <= 0) {
+      // "0." + leading zeros + digits
+      buffer[0] = '0';
+      buffer[1] = '.';
+      memset(buffer + 2, '0', -k);
+      memcpy(buffer + 2 + (-k), dptr, nd);
+      return buffer + 2 + (-k) + nd;
+    }
+    if (k >= nd) {
+      // digits + trailing zeros (no decimal point)
+      memcpy(buffer, dptr, nd);
+      memset(buffer + nd, '0', k - nd);
+      return buffer + k;
+    }
+    // digits with decimal point in the middle
+    memcpy(buffer, dptr, k);
+    buffer[k] = '.';
+    memcpy(buffer + k + 1, dptr + k, nd - k);
+    return buffer + nd + 1;
+  }
+
   auto dig = to_digits<traits::num_bits>(buffer + 1, dec.sig, extra_digit);
   buffer += extra_digit + (split_last_digit ? 0 : 1);
   memcpy(buffer, &dig.digits, sizeof(dig.digits));
@@ -1239,22 +1304,25 @@ auto write(Float value, char* buffer) noexcept -> char* {
     memcpy(buffer, &exp_data, traits::max_exponent10 >= 100 ? 8 : 4);
     return buffer + len;
   }
-  uint16_t e_sign = dec_exp >= 0 ? ('+' << 8 | 'e') : ('-' << 8 | 'e');
-  if (is_big_endian) e_sign = e_sign << 8 | e_sign >> 8;
-  memcpy(buffer, &e_sign, 2);
-  buffer += 2;
-  dec_exp = dec_exp >= 0 ? dec_exp : -dec_exp;
-  if (traits::max_exponent10 >= 100) {
-    // digit = dec_exp / 100
+  // Dragonbox-compatible: no '+' for positive, no zero-padding.
+  *buffer++ = 'e';
+  if (dec_exp < 0) {
+    *buffer++ = '-';
+    dec_exp = -dec_exp;
+  }
+  if (traits::max_exponent10 >= 100 && dec_exp >= 100) {
     uint32_t digit = use_umul128_hi64
                          ? umul128_hi64(dec_exp, 0x290000000000000)
                          : (uint32_t(dec_exp) * div100_sig) >> div100_exp;
-    *buffer = '0' + digit;
-    buffer += dec_exp >= 100;
+    *buffer++ = '0' + digit;
     dec_exp -= digit * 100;
   }
-  memcpy(buffer, digits2(dec_exp), 2);
-  return buffer + 2;
+  if (dec_exp >= 10) {
+    memcpy(buffer, digits2(dec_exp), 2);
+    return buffer + 2;
+  }
+  *buffer = '0' + dec_exp;
+  return buffer + 1;
 }
 
 template auto write(float value, char* buffer) noexcept -> char*;
