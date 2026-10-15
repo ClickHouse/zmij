@@ -354,7 +354,9 @@ template <typename Float> struct float_traits : std::numeric_limits<Float> {
   static constexpr int exp_mask = (1 << num_exp_bits) - 1;
   static constexpr int exp_bias = (1 << (num_exp_bits - 1)) - 1;
   static constexpr int exp_offset = exp_bias + num_sig_bits;
-  static constexpr int min_fixed_dec_exp = -4;
+  // ClickHouse: -6 for doubles to match dragonbox (floats handle -6 and -5
+  // outside their SIMD shuffle table, which has no room for the extra zeros).
+  static constexpr int min_fixed_dec_exp = float_traits::digits > 24 ? -6 : -4;
   static constexpr int max_fixed_dec_exp =
       compute_dec_exp(float_traits::digits + 1) - 1;
 

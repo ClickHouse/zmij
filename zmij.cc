@@ -362,19 +362,26 @@ struct exp_string_table {
     exp_string_table t;
     for (int e = min_dec_exp; e <= traits::max_exponent10 && enable; ++e) {
       uint64_t abs_e = e >= 0 ? e : -e;
-      // Left-aligning a two-digit exponent pads it with the '0' byte 4 holds.
-      uint64_t ddd = abs_e < 100 ? abs_e * 10 : abs_e;
-      uint64_t val = (ddd / 100 + '0') | ((ddd / 10 % 10 + '0') << 8) |
-                     ((ddd % 10 + '0') << 16);
-      uint64_t len = 4 + (abs_e >= 100);
-      // Bytes: 'e', sign, two digits, a third digit or '0', '.', '0', length.
-      // The float emitters insert an entry whole and add their last digit to
-      // the '0' in byte 4, so the point and the zero their shuffles need ride
-      // along and the length lands in a register byte nothing reads; the
-      // double path stores all eight bytes and returns past `len` of them.
-      t.data[e + offset] = (len << 56) | (uint64_t('0') << 48) |
-                           (uint64_t('.') << 40) | (val << 16) |
-                           (uint64_t(e >= 0 ? '+' : '-') << 8) | 'e';
+      // Dragonbox-compatible (ClickHouse): 'e', '-' only if negative, then
+      // the digits without padding, e.g. "e7", "e-45", "e308".
+      char s[8] = {'e'};
+      int len = 1;
+      if (e < 0) s[len++] = '-';
+      if (abs_e >= 100) s[len++] = char('0' + abs_e / 100);
+      if (abs_e >= 10) s[len++] = char('0' + abs_e / 10 % 10);
+      s[len++] = char('0' + abs_e % 10);
+      // Bytes 4-6 are '0', '.', '0' unless overwritten by a 5-byte exponent
+      // (doubles only). The float emitters insert an entry whole and add
+      // their last digit to the '0' in byte 4, so the point and the zero
+      // their shuffles need ride along. Byte 7 is the length, 0 in the fixed
+      // range [-6, 20] so the float emitters can add it unconditionally.
+      if (len < 5) s[4] = '0';
+      s[5] = '.';
+      s[6] = '0';
+      s[7] = char(e >= -6 && e <= 20 ? 0 : len);
+      uint64_t val = 0;
+      for (int i = 0; i < 8; ++i) val |= uint64_t(uint8_t(s[i])) << (i * 8);
+      t.data[e + offset] = val;
     }
     return t;
   }
@@ -487,8 +494,9 @@ struct float_shuffle_table {
           for (int z = 0; z < lead_zeros; ++z) out[len++] = zero_pos;
           for (int j = split; j < s.len; ++j) out[len++] = s.pos[j];
         }
+        // The exponent is up to 4 bytes; its length is added by the emitter.
         if (slot == sci_slot) {
-          for (int i = 0; i < 4; ++i) out[len++] = exp_pos + i;
+          for (int i = 0; i < 4; ++i) out[len + i] = exp_pos + i;
         }
         out[15] = len;
       }
@@ -991,8 +999,8 @@ ZMIJ_INLINE auto write_float_simd(char* buffer, const dec_digits<32>& dig,
   // exp_pos (8), so the exp string fills exp_pos..exp_pos+3, its '.' and '0'
   // land at point_pos (13) and zero_pos (14), and its '0' at last_digit_pos
   // (12) only has the last digit added to it. The entry's length ends up in
-  // byte 15, which no shuffle reads; the output length comes from the shuffle
-  // entry.
+  // byte 15, which no shuffle reads; the output length is the shuffle entry's
+  // plus the exponent length (0 in the fixed range).
   uint64_t exp_data = d.exp_strings.data[dec_exp + exp_string_table::offset];
   uint64_t tail = exp_data + (uint64_t(last_digit) << 32);
   auto entry = d.float_shuffles.get_entry(dec_exp, dig.num_digits,
@@ -1012,7 +1020,7 @@ ZMIJ_INLINE auto write_float_simd(char* buffer, const dec_digits<32>& dig,
   uint8x16_t out = vqtbl1q_u8(src, shuffle);
   vst1q_u8(reinterpret_cast<uint8_t*>(buffer), out);
 #endif
-  return buffer + entry.length;
+  return buffer + entry.length + int(exp_data >> 56);
 }
 
 ZMIJ_INLINE auto write_float_simd(char*, const dec_digits<64>&, int, bool, bool,
@@ -1595,6 +1603,40 @@ auto write_big_exp(char* buffer, int dec_exp) noexcept -> char* {
   return buffer + 2;
 }
 
+// Writes `sig` (without trailing zeros) in fixed notation with the leading
+// digit at 10**dec_exp, e.g. "0.0000012", "120000000000000000000" or "1.5".
+auto write_fixed_extended(char* buffer, uint64_t sig, int dec_exp) noexcept
+    -> char* {
+  char digits[20];
+  int pos = 20;
+  do {
+    digits[--pos] = char('0' + sig % 10);
+    sig /= 10;
+  } while (sig > 0);
+  int end = 20;
+  while (digits[end - 1] == '0') --end;
+  const char* dptr = digits + pos;
+  int nd = end - pos;
+
+  int k = dec_exp + 1;  // decimal point position
+  if (k <= 0) {
+    buffer[0] = '0';
+    buffer[1] = '.';
+    memset(buffer + 2, '0', size_t(-k));
+    memcpy(buffer + 2 - k, dptr, size_t(nd));
+    return buffer + 2 - k + nd;
+  }
+  if (k >= nd) {
+    memcpy(buffer, dptr, size_t(nd));
+    memset(buffer + nd, '0', size_t(k - nd));
+    return buffer + k;
+  }
+  memcpy(buffer, dptr, size_t(k));
+  buffer[k] = '.';
+  memcpy(buffer + k + 1, dptr + k, size_t(nd - k));
+  return buffer + nd + 1;
+}
+
 // It is slightly faster to return a pointer to the end than the size.
 template <typename Float>
 auto write(char* buffer, Float value) noexcept -> char* {
@@ -1612,7 +1654,10 @@ auto write(char* buffer, Float value) noexcept -> char* {
 
   shortest_decimal dec;
   if (!traits::is_normal(bin_exp)) [[ZMIJ_UNLIKELY]] {
-    if (bin_exp != 0) return write_inf_nan(buffer, bin_sig != 0);
+    // NaN never carries a sign (dragonbox compatibility).
+    if (bin_exp != 0)
+      return write_inf_nan(buffer - (bin_sig != 0 && traits::is_negative(bits)),
+                           bin_sig != 0);
     if (bin_sig == 0) {
       *buffer = '0';
       return buffer + 1;
@@ -1640,6 +1685,16 @@ auto write(char* buffer, Float value) noexcept -> char* {
     dec.sig = 10 * dec.sig + (-has_last_digit & dec.last_digit);
     has_last_digit = false;
     --dec_exp;
+  }
+
+  // Dragonbox-compatible (ClickHouse): fixed notation for dec_exp in [-6, 20].
+  // The edges outside upstream's fixed range take this scalar path.
+  if (dec_exp >= -6 && dec_exp <= 20 &&
+      (dec_exp < traits::min_fixed_dec_exp ||
+       dec_exp > traits::max_fixed_dec_exp)) [[ZMIJ_UNLIKELY]] {
+    uint64_t full_sig =
+        has_last_digit ? dec.sig * 10 + dec.last_digit : dec.sig;
+    return write_fixed_extended(buffer, full_sig, dec_exp);
   }
 
   auto dig = to_digits<traits::num_bits>(dec.sig, *d);
@@ -1704,7 +1759,24 @@ auto write(char* buffer, Float value) noexcept -> char* {
     memcpy(buffer, &exp_data, traits::max_exponent10 >= 100 ? 8 : 4);
     return buffer + len;
   }
-  return write_exp<Float>(buffer, dec_exp);
+  // Dragonbox-compatible: no '+' for positive, no zero-padding.
+  *buffer++ = 'e';
+  if (dec_exp < 0) {
+    *buffer++ = '-';
+    dec_exp = -dec_exp;
+  }
+  if (dec_exp >= 100) {
+    *buffer++ = char('0' + dec_exp / 100);
+    dec_exp %= 100;
+    memcpy(buffer, digits2(dec_exp), 2);
+    return buffer + 2;
+  }
+  if (dec_exp >= 10) {
+    memcpy(buffer, digits2(dec_exp), 2);
+    return buffer + 2;
+  }
+  *buffer = char('0' + dec_exp);
+  return buffer + 1;
 }
 
 template <typename Float>
